@@ -7,12 +7,11 @@ set -e
 ROOT_DIR="$(pwd)"
 DEMO_DIR="$ROOT_DIR/webassembly-ffmpeg-demo"
 FFMPEG_SRC="$ROOT_DIR/FFmpeg"
-BUILD_DIR="$ROOT_DIR/build-ffmpeg"
 PREFIX_DIR="$ROOT_DIR/prefix"
 INSTALL_DIR="$DEMO_DIR/wasm/dist"
 EMSDK_DIR="$ROOT_DIR/emsdk"
 
-mkdir -p "$BUILD_DIR" "$PREFIX_DIR" "$INSTALL_DIR"
+mkdir -p "$PREFIX_DIR" "$INSTALL_DIR"
 
 # ================================
 # 检查 Emscripten 是否安装
@@ -72,7 +71,7 @@ echo "⚙️ 配置 FFmpeg..."
 # ================================
 echo "🔨 编译 FFmpeg..."
 make clean
-make -j$(nproc)
+make -j$(sysctl -n hw.ncpu)
 make install
 
 # ================================

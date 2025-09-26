@@ -237,7 +237,7 @@ cleanup:
 // 解码视频 (MP4/H.264 → RGBA)
 // =========================
 extern "C" int decode_h264_to_rgba(const uint8_t *input, int input_size,
-                                   uint8_t **output, int *width, int *height) {
+                                   uint8_t **output, int *width, int *height, int *frames) {
     AVFormatContext *fmt_ctx = NULL;
     AVCodecContext *codec_ctx = NULL;
     const AVCodec *codec = NULL;
@@ -249,6 +249,7 @@ extern "C" int decode_h264_to_rgba(const uint8_t *input, int input_size,
     *output = NULL;
     *width = 0;
     *height = 0;
+    if (frames) *frames = 0;
     
     // 调试信息
     printf("C++ 视频调试: input_size=%d\n", input_size);
@@ -376,17 +377,11 @@ extern "C" int decode_h264_to_rgba(const uint8_t *input, int input_size,
                     // 验证内存中的值
                     printf("C++ 视频调试: 内存验证 width=%d, height=%d\n", *width, *height);
                     
-                    // 分配输出缓冲区
-                    int numBytes = av_image_get_buffer_size(AV_PIX_FMT_RGBA, *width, *height, 1);
-                    *output = (uint8_t *)malloc(numBytes);
+                    // 分配输出缓冲区（延后分配，等知道帧数后逐步扩容）
+                    int frameBytes = av_image_get_buffer_size(AV_PIX_FMT_RGBA, *width, *height, 1);
+                    printf("C++ 视频调试: 每帧字节数: %d\n", frameBytes);
                     
-                    if (!*output) {
-                        printf("C++ 错误: 无法分配输出缓冲区\n");
-                        goto cleanup;
-                    }
-                    
-                    av_image_fill_arrays(frameRGBA->data, frameRGBA->linesize,
-                                         *output, AV_PIX_FMT_RGBA, *width, *height, 1);
+                    // 不在这里分配 *output，而是在处理第一帧时分配
 
                     sws = sws_getContext(*width, *height, (AVPixelFormat)frame->format,
                                          *width, *height, AV_PIX_FMT_RGBA,
@@ -399,19 +394,42 @@ extern "C" int decode_h264_to_rgba(const uint8_t *input, int input_size,
                 }
 
                 // 转换颜色空间
-                if (sws && *output) {
+                if (sws) {
+                    // 为当前帧准备临时缓冲区
+                    int frameBytes = av_image_get_buffer_size(AV_PIX_FMT_RGBA, *width, *height, 1);
+                    uint8_t *temp = (uint8_t*)malloc(frameBytes);
+                    if (!temp) { goto cleanup; }
+                    
+                    // 设置临时缓冲区的数据指针
+                    av_image_fill_arrays(frameRGBA->data, frameRGBA->linesize,
+                                         temp, AV_PIX_FMT_RGBA, *width, *height, 1);
+                    
+                    // 转换到临时缓冲区
                     int ret = sws_scale(sws,
                                        (const uint8_t * const*)frame->data, frame->linesize,
                                        0, *height, frameRGBA->data, frameRGBA->linesize);
                     
                     if (ret > 0) {
                         printf("C++ 视频调试: 成功转换帧到 RGBA，转换了 %d 行\n", ret);
-                        // 确保宽度和高度被正确设置
-                        printf("C++ 视频最终调试: *output=%p, *width=%d, *height=%d\n", *output, *width, *height);
-                        goto cleanup; // 只处理第一帧
+                        
+                        // 追加到输出缓冲区
+                        if (*output == NULL) {
+                            *output = (uint8_t*)malloc(frameBytes);
+                            if (!*output) { free(temp); goto cleanup; }
+                            memcpy(*output, temp, frameBytes);
+                        } else {
+                            size_t oldSize = (size_t)(*frames) * (size_t)frameBytes;
+                            uint8_t *newBuf = (uint8_t*)realloc(*output, oldSize + frameBytes);
+                            if (!newBuf) { free(temp); goto cleanup; }
+                            *output = newBuf;
+                            memcpy(*output + oldSize, temp, frameBytes);
+                        }
+                        if (frames) { (*frames)++; }
+                        printf("C++ 视频调试: 已处理 %d 帧\n", *frames);
                     } else {
                         printf("C++ 错误: 颜色空间转换失败\n");
                     }
+                    free(temp);
                 }
             }
         }

@@ -177,6 +177,51 @@
   <script type="module">
     import { ensureFFmpeg, decodeOpusToWavBlob, decodeMp4ToWebmBlob } from '/src/ffmpeg.js';
     
+    // 通用函数：获取支持的 MIME 类型
+    function getSupportedMimeType() {
+      const supportedTypes = [
+        'video/webm;codecs=vp8',
+        'video/webm;codecs=vp9',
+        'video/webm',
+        'video/mp4'
+      ];
+      
+      for (const type of supportedTypes) {
+        if (MediaRecorder.isTypeSupported(type)) {
+          return type;
+        }
+      }
+      return 'video/webm';
+    }
+    
+    // 通用函数：创建 WAV 文件头
+    function createWavHeader(sampleRate, channels, dataSize) {
+      const buffer = new ArrayBuffer(44);
+      const view = new DataView(buffer);
+      
+      const writeString = (offset, string) => {
+        for (let i = 0; i < string.length; i++) {
+          view.setUint8(offset + i, string.charCodeAt(i));
+        }
+      };
+      
+      writeString(0, 'RIFF');
+      view.setUint32(4, 36 + dataSize, true);
+      writeString(8, 'WAVE');
+      writeString(12, 'fmt ');
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
+      view.setUint16(22, channels, true);
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, sampleRate * channels * 2, true);
+      view.setUint16(32, channels * 2, true);
+      view.setUint16(34, 16, true);
+      writeString(36, 'data');
+      view.setUint32(40, dataSize, true);
+      
+      return buffer;
+    }
+    
     // 原生 Web API 解码功能
     class NativeAudioDecoder {
       constructor() {
@@ -186,6 +231,9 @@
       }
       
       async decodeAudioFile(file) {
+        const startTime = performance.now();
+        let pcmConversionTime = 0;
+        
         if (!('AudioDecoder' in window)) {
           throw new Error('AudioDecoder API 不支持，请使用支持 WebCodecs 的浏览器');
         }
@@ -219,12 +267,28 @@
             data: opusData
           });
           
+          // 记录 PCM 转换开始时间
+          const pcmStartTime = performance.now();
+          
           this.isDecoding = true;
           this.decoder.decode(encodedChunk);
           await this.decoder.flush();
           
+          // 记录 PCM 转换结束时间
+          pcmConversionTime = performance.now() - pcmStartTime;
+          
           // 转换为 WAV 格式
-          return this.convertToWavBlob();
+          const wavResult = this.convertToWavBlob();
+          
+          const endTime = performance.now();
+          const totalDuration = endTime - startTime;
+          
+          return {
+            blob: wavResult,
+            duration: totalDuration,
+            pcmConversionTime: pcmConversionTime,
+            size: wavResult.size
+          };
         } catch (error) {
           // 如果 WebCodecs 解码失败，尝试使用 Web Audio API 作为备选方案
           console.warn('WebCodecs AudioDecoder 失败，尝试使用 Web Audio API:', error.message);
@@ -233,17 +297,39 @@
       }
       
       async decodeWithWebAudioAPI(file) {
+        const startTime = performance.now();
+        let pcmConversionTime = 0;
+        
         // 使用 Web Audio API 作为备选方案
         const audioContext = new (window.AudioContext || window.webkitAudioContext)();
         
         try {
           const arrayBuffer = await file.arrayBuffer();
+          
+          // 记录 PCM 转换开始时间
+          const pcmStartTime = performance.now();
+          
           const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
           
+          // 记录 PCM 转换结束时间
+          pcmConversionTime = performance.now() - pcmStartTime;
+          
           // 转换为 WAV 格式
-          return this.audioBufferToWav(audioBuffer);
+          const wavBlob = this.audioBufferToWav(audioBuffer);
+          
+          const endTime = performance.now();
+          const totalDuration = endTime - startTime;
+          
+          return {
+            blob: wavBlob,
+            duration: totalDuration,
+            pcmConversionTime: pcmConversionTime,
+            size: wavBlob.size
+          };
         } catch (error) {
-          throw new Error(`音频解码失败: ${error.message}`);
+          const endTime = performance.now();
+          const totalDuration = endTime - startTime;
+          throw new Error(`音频解码失败: ${error.message} (总耗时: ${totalDuration.toFixed(2)}ms, PCM转换: ${pcmConversionTime.toFixed(2)}ms)`);
         }
       }
       
@@ -253,29 +339,10 @@
         const length = audioBuffer.length;
         
         // 创建 WAV 文件
-        const buffer = new ArrayBuffer(44 + length * numberOfChannels * 2);
-        const view = new DataView(buffer);
-        
-        // WAV 头部
-        const writeString = (offset, string) => {
-          for (let i = 0; i < string.length; i++) {
-            view.setUint8(offset + i, string.charCodeAt(i));
-          }
-        };
-        
-        writeString(0, 'RIFF');
-        view.setUint32(4, 36 + length * numberOfChannels * 2, true);
-        writeString(8, 'WAVE');
-        writeString(12, 'fmt ');
-        view.setUint32(16, 16, true);
-        view.setUint16(20, 1, true);
-        view.setUint16(22, numberOfChannels, true);
-        view.setUint32(24, sampleRate, true);
-        view.setUint32(28, sampleRate * numberOfChannels * 2, true);
-        view.setUint16(32, numberOfChannels * 2, true);
-        view.setUint16(34, 16, true);
-        writeString(36, 'data');
-        view.setUint32(40, length * numberOfChannels * 2, true);
+        const dataSize = length * numberOfChannels * 2;
+        const wavHeader = createWavHeader(sampleRate, numberOfChannels, dataSize);
+        const buffer = new ArrayBuffer(wavHeader.byteLength + dataSize);
+        new Uint8Array(buffer, 0, wavHeader.byteLength).set(new Uint8Array(wavHeader));
         
         // 复制音频数据
         const wavData = new Int16Array(buffer, 44);
@@ -400,30 +467,10 @@
           pcmData[i] = Math.max(-32768, Math.min(32767, audioView[i] * 32768));
         }
         
-        const length = pcmData.length * 2; // 16-bit = 2 bytes per sample
-        const buffer = new ArrayBuffer(44 + length);
-        const view = new DataView(buffer);
-        
-        // WAV 头部
-        const writeString = (offset, string) => {
-          for (let i = 0; i < string.length; i++) {
-            view.setUint8(offset + i, string.charCodeAt(i));
-          }
-        };
-        
-        writeString(0, 'RIFF');
-        view.setUint32(4, 36 + length, true);
-        writeString(8, 'WAVE');
-        writeString(12, 'fmt ');
-        view.setUint32(16, 16, true);
-        view.setUint16(20, 1, true); // PCM format
-        view.setUint16(22, numberOfChannels, true);
-        view.setUint32(24, sampleRate, true);
-        view.setUint32(28, sampleRate * numberOfChannels * 2, true); // byte rate
-        view.setUint16(32, numberOfChannels * 2, true); // block align
-        view.setUint16(34, 16, true); // bits per sample
-        writeString(36, 'data');
-        view.setUint32(40, length, true);
+        const dataSize = pcmData.length * 2; // 16-bit = 2 bytes per sample
+        const wavHeader = createWavHeader(sampleRate, numberOfChannels, dataSize);
+        const buffer = new ArrayBuffer(wavHeader.byteLength + dataSize);
+        new Uint8Array(buffer, 0, wavHeader.byteLength).set(new Uint8Array(wavHeader));
         
         // 复制 PCM 数据
         const wavView = new Int16Array(buffer, 44);
@@ -441,6 +488,9 @@
       }
       
       async decodeVideoFile(file) {
+        const startTime = performance.now();
+        let rgbaConversionTime = 0;
+        
         if (!('VideoDecoder' in window)) {
           throw new Error('VideoDecoder API 不支持，请使用支持 WebCodecs 的浏览器');
         }
@@ -466,21 +516,51 @@
           
           // 从 MP4 文件中提取 H.264 数据
           const h264Data = this.extractH264FromMP4(arrayBuffer);
-          
-          // 创建编码数据
-          const encodedChunk = new EncodedVideoChunk({
-            type: 'key',
-            timestamp: 0,
-            duration: 1000000, // 1秒
-            data: h264Data
-          });
-          
+          // 尝试解码多个数据包
           this.isDecoding = true;
-          this.decoder.decode(encodedChunk);
+          
+          // 将 H.264 数据分割成多个数据包
+          const h264Array = new Uint8Array(h264Data);
+          const packets = this.splitH264IntoPackets(h264Array);
+          
+          // 记录 RGBA 转换开始时间
+          const rgbaStartTime = performance.now();
+          
+          for (let i = 0; i < packets.length; i++) {
+            const packet = packets[i];
+            const encodedChunk = new EncodedVideoChunk({
+              type: i === 0 ? 'key' : 'delta', // 第一帧是关键帧
+              timestamp: i * 33333, // 30 FPS = 33.33ms per frame
+              duration: 33333,
+              data: packet
+            });
+            
+            this.decoder.decode(encodedChunk);
+          }
+          
           await this.decoder.flush();
           
+          // 记录 RGBA 转换结束时间
+          rgbaConversionTime = performance.now() - rgbaStartTime;
+          
+          // 如果没有解码出帧，尝试使用 Canvas 备选方案
+          if (this.videoFrames.length === 0) {
+            console.log('原生解码: 没有解码出帧，使用 Canvas 备选方案');
+            return this.decodeWithCanvas(file);
+          }
+          
           // 转换为 WebM 格式
-          return this.convertToWebmBlob();
+          const webmResult = this.convertToWebmBlob();
+          
+          const endTime = performance.now();
+          const totalDuration = endTime - startTime;
+          
+          return {
+            blob: webmResult,
+            duration: totalDuration,
+            rgbaConversionTime: rgbaConversionTime,
+            size: webmResult.size
+          };
         } catch (error) {
           // 如果 WebCodecs 解码失败，尝试使用 Canvas 作为备选方案
           console.warn('WebCodecs VideoDecoder 失败，尝试使用 Canvas 备选方案:', error.message);
@@ -489,6 +569,9 @@
       }
       
       async decodeWithCanvas(file) {
+        const startTime = performance.now();
+        let rgbaConversionTime = 0;
+        
         // 使用 Canvas 作为备选方案
         const video = document.createElement('video');
         const canvas = document.createElement('canvas');
@@ -499,21 +582,79 @@
             canvas.width = video.videoWidth;
             canvas.height = video.videoHeight;
             
+            
+            // 创建 MediaStream
+            const stream = canvas.captureStream(30); // 30 FPS
+            
+            const mimeType = getSupportedMimeType();
+            
+            
+            const mediaRecorder = new MediaRecorder(stream, {
+              mimeType: mimeType
+            });
+            
+            const chunks = [];
+            mediaRecorder.ondataavailable = (event) => {
+              if (event.data.size > 0) {
+                chunks.push(event.data);
+              }
+            };
+            
+            mediaRecorder.onstop = () => {
+              const webmBlob = new Blob(chunks, { type: mimeType });
+              
+              const endTime = performance.now();
+              const totalDuration = endTime - startTime;
+              
+              resolve({
+                blob: webmBlob,
+                duration: totalDuration,
+                rgbaConversionTime: rgbaConversionTime,
+                size: webmBlob.size
+              });
+            };
+            
+            mediaRecorder.onerror = (error) => {
+              console.error('Canvas 备选方案: MediaRecorder 错误:', error);
+              reject(new Error(`MediaRecorder 错误: ${error.message}`));
+            };
+            
+            // 开始录制
+            mediaRecorder.start(100);
+            
+            // 播放视频并录制
             video.oncanplay = () => {
-              ctx.drawImage(video, 0, 0);
-              canvas.toBlob((blob) => {
-                if (blob) {
-                  resolve(blob);
+              
+              const videoDuration = 5000; // 5秒
+              const frameRate = 30; // 30 FPS
+              const totalFrames = Math.floor((videoDuration / 1000) * frameRate); // 150帧
+              const frameInterval = 1000 / frameRate; // 33.33ms per frame
+              
+              let currentFrame = 0;
+              
+              const drawFrame = () => {
+                if (currentFrame < totalFrames) {
+                  // 绘制视频帧到 Canvas
+                  ctx.drawImage(video, 0, 0);
+                  currentFrame++;
+                  setTimeout(drawFrame, frameInterval);
                 } else {
-                  reject(new Error('Canvas 转换失败'));
+                  // 录制完成
+                  setTimeout(() => {
+                    mediaRecorder.stop();
+                  }, 200);
                 }
-              }, 'video/webm');
+              };
+              
+              // 开始绘制帧
+              drawFrame();
             };
             
             video.play();
           };
           
-          video.onerror = () => {
+          video.onerror = (error) => {
+            console.error('Canvas 备选方案: 视频加载失败:', error);
             reject(new Error('视频加载失败'));
           };
           
@@ -569,6 +710,7 @@
         const data = new Uint8Array(arrayBuffer);
         const h264Frames = [];
         
+        
         // 简化的 MP4 解析，查找 H.264 数据
         let offset = 0;
         while (offset < data.length - 8) {
@@ -605,6 +747,7 @@
           }
         }
         
+        
         // 合并所有 H.264 帧数据
         const totalSize = h264Frames.reduce((sum, frame) => sum + frame.length, 0);
         const result = new Uint8Array(totalSize);
@@ -618,24 +761,137 @@
         return result.buffer;
       }
       
+      splitH264IntoPackets(h264Data) {
+        const packets = [];
+        let offset = 0;
+        
+        while (offset < h264Data.length - 4) {
+          // 查找 NAL 单元起始码
+          if ((h264Data[offset] === 0x00 && h264Data[offset + 1] === 0x00 && 
+               h264Data[offset + 2] === 0x00 && h264Data[offset + 3] === 0x01) ||
+              (h264Data[offset] === 0x00 && h264Data[offset + 1] === 0x00 && 
+               h264Data[offset + 2] === 0x01)) {
+            
+            const startCodeLength = (h264Data[offset + 2] === 0x01) ? 3 : 4;
+            let packetStart = offset + startCodeLength;
+            
+            // 查找下一个起始码
+            let packetEnd = packetStart;
+            while (packetEnd < h264Data.length - 4) {
+              if ((h264Data[packetEnd] === 0x00 && h264Data[packetEnd + 1] === 0x00 && 
+                   h264Data[packetEnd + 2] === 0x00 && h264Data[packetEnd + 3] === 0x01) ||
+                  (h264Data[packetEnd] === 0x00 && h264Data[packetEnd + 1] === 0x00 && 
+                   h264Data[packetEnd + 2] === 0x01)) {
+                break;
+              }
+              packetEnd++;
+            }
+            
+            // 提取数据包
+            const packetData = h264Data.slice(packetStart, packetEnd);
+            if (packetData.length > 0) {
+              packets.push(packetData.buffer);
+            }
+            
+            offset = packetEnd;
+          } else {
+            offset++;
+          }
+        }
+        
+        return packets;
+      }
       
-      convertToWebmBlob() {
+      
+      async convertToWebmBlob() {
         if (this.videoFrames.length === 0) {
           throw new Error('没有视频帧数据');
         }
         
-        // 这里简化处理，实际需要更复杂的 WebM 编码
-        // 创建一个简单的 WebM 容器
+        // 使用 MediaRecorder API 生成真正的 WebM 文件
         const canvas = document.createElement('canvas');
         const ctx = canvas.getContext('2d');
         const frame = this.videoFrames[0];
         
         canvas.width = frame.displayWidth;
         canvas.height = frame.displayHeight;
-        ctx.drawImage(frame, 0, 0);
         
-        return new Promise((resolve) => {
-          canvas.toBlob(resolve, 'video/webm');
+        
+        // 创建 MediaStream
+        const stream = canvas.captureStream(30); // 30 FPS
+        
+        const mimeType = getSupportedMimeType();
+        
+        
+        // 使用 MediaRecorder 录制为 WebM
+        const mediaRecorder = new MediaRecorder(stream, {
+          mimeType: mimeType
+        });
+        
+        const chunks = [];
+        mediaRecorder.ondataavailable = (event) => {
+          if (event.data.size > 0) {
+            chunks.push(event.data);
+          }
+        };
+        
+        return new Promise((resolve, reject) => {
+          mediaRecorder.onstop = () => {
+            const webmBlob = new Blob(chunks, { type: mimeType });
+            resolve(webmBlob);
+          };
+          
+          mediaRecorder.onerror = (error) => {
+            console.error('MediaRecorder 错误:', error);
+            reject(new Error(`MediaRecorder 错误: ${error.message}`));
+          };
+          
+          // 开始录制
+          mediaRecorder.start(100); // 每100ms生成一个数据块
+          
+          // 绘制所有帧并录制
+          let frameIndex = 0;
+          const frameDuration = 1000 / 30; // 30 FPS = 33.33ms per frame
+          
+          const drawFrame = () => {
+            if (frameIndex < this.videoFrames.length) {
+              const currentFrame = this.videoFrames[frameIndex];
+              ctx.drawImage(currentFrame, 0, 0);
+              frameIndex++;
+              
+              // 使用 setTimeout 而不是 requestAnimationFrame 来控制帧率
+              setTimeout(drawFrame, frameDuration);
+            } else {
+            // 如果只有一帧，重复播放创建短视频
+            if (this.videoFrames.length === 1) {
+              const videoDuration = 5000; // 5秒
+              const totalFrames = Math.floor((videoDuration / 1000) * 30); // 150帧
+                let repeatFrame = 0;
+                
+                const repeatFrameFunc = () => {
+                  if (repeatFrame < totalFrames) {
+                    ctx.drawImage(this.videoFrames[0], 0, 0);
+                    repeatFrame++;
+                    setTimeout(repeatFrameFunc, frameDuration);
+                  } else {
+                    setTimeout(() => {
+                      mediaRecorder.stop();
+                    }, 200);
+                  }
+                };
+                
+                repeatFrameFunc();
+              } else {
+                // 录制完成，等待一段时间确保所有数据都被录制
+                setTimeout(() => {
+                  mediaRecorder.stop();
+                }, 500); // 给更多时间让最后一帧被录制
+              }
+            }
+          };
+          
+          // 开始绘制第一帧
+          drawFrame();
         });
       }
     }
@@ -670,32 +926,30 @@
         logEl.textContent += '1. 测试原生 AudioDecoder API...\n';
         try {
           const nativeDecoder = new NativeAudioDecoder();
-          const nativeStartTime = performance.now();
-          const nativeBlob = await nativeDecoder.decodeAudioFile(file);
-          const nativeEndTime = performance.now();
+          const nativeResult = await nativeDecoder.decodeAudioFile(file);
           results.native = {
-            blob: nativeBlob,
-            time: nativeEndTime - nativeStartTime,
-            size: nativeBlob.size
+            blob: nativeResult.blob,
+            time: nativeResult.duration,
+            pcmTime: nativeResult.pcmConversionTime,
+            size: nativeResult.size
           };
-          logEl.textContent += `   ✓ 原生解码完成，耗时: ${results.native.time.toFixed(2)}ms\n`;
+          logEl.textContent += `   ✓ 原生解码完成，总耗时: ${results.native.time.toFixed(2)}ms (PCM转换: ${results.native.pcmTime?.toFixed(2) || 'N/A'}ms)\n`;
         } catch (error) {
           logEl.textContent += `   ✗ 原生解码失败: ${error.message}\n`;
           results.native = { error: error.message };
         }
         
         // 测试 WASM 解码
-        logEl.textContent += '\n2. 测试 WASM (FFmpeg) 解码...\n';
+        logEl.textContent += '\n2. 测试 WASM (FFmpeg) 解码 + MediaRecorder 编码...\n';
         try {
-          const wasmStartTime = performance.now();
-          results.wasm = await decodeOpusToWavBlob(file);
-          const wasmEndTime = performance.now();
+          const wasmResult = await decodeOpusToWavBlob(file);
           results.wasm = {
-            blob: results.wasm,
-            time: wasmEndTime - wasmStartTime,
-            size: results.wasm.size
+            blob: wasmResult.blob,
+            time: wasmResult.duration,
+            pcmTime: wasmResult.pcmConversionTime,
+            size: wasmResult.size
           };
-          logEl.textContent += `   ✓ WASM解码完成，耗时: ${results.wasm.time.toFixed(2)}ms\n`;
+          logEl.textContent += `   ✓ WASM解码完成，总耗时: ${results.wasm.time.toFixed(2)}ms (PCM转换: ${results.wasm.pcmTime?.toFixed(2) || 'N/A'}ms)\n`;
         } catch (error) {
           logEl.textContent += `   ✗ WASM解码失败: ${error.message}\n`;
           results.wasm = { error: error.message };
@@ -739,38 +993,36 @@
         statusEl.className = 'status info';
         statusEl.textContent = '正在进行视频解码对比...';
         statusEl.style.display = 'block';
-        logEl.textContent = '开始视频解码性能对比...\n\n';
+        logEl.textContent = '开始视频解码性能对比（生成有效 WebM 文件）...\n\n';
         
         // 测试原生 VideoDecoder
-        logEl.textContent += '1. 测试原生 VideoDecoder API...\n';
+        logEl.textContent += '1. 测试原生 VideoDecoder API + MediaRecorder 编码...\n';
         try {
           const nativeDecoder = new NativeVideoDecoder();
-          const nativeStartTime = performance.now();
-          const nativeBlob = await nativeDecoder.decodeVideoFile(file);
-          const nativeEndTime = performance.now();
+          const nativeResult = await nativeDecoder.decodeVideoFile(file);
           results.native = {
-            blob: nativeBlob,
-            time: nativeEndTime - nativeStartTime,
-            size: nativeBlob.size
+            blob: nativeResult.blob,
+            time: nativeResult.duration,
+            rgbaTime: nativeResult.rgbaConversionTime,
+            size: nativeResult.size
           };
-          logEl.textContent += `   ✓ 原生解码完成，耗时: ${results.native.time.toFixed(2)}ms\n`;
+          logEl.textContent += `   ✓ 原生解码完成，总耗时: ${results.native.time.toFixed(2)}ms (RGBA转换: ${results.native.rgbaTime?.toFixed(2) || 'N/A'}ms)\n`;
         } catch (error) {
           logEl.textContent += `   ✗ 原生解码失败: ${error.message}\n`;
           results.native = { error: error.message };
         }
         
         // 测试 WASM 解码
-        logEl.textContent += '\n2. 测试 WASM (FFmpeg) 解码...\n';
+        logEl.textContent += '\n2. 测试 WASM (FFmpeg) 解码 + MediaRecorder 编码...\n';
         try {
-          const wasmStartTime = performance.now();
-          results.wasm = await decodeMp4ToWebmBlob(file);
-          const wasmEndTime = performance.now();
+          const wasmResult = await decodeMp4ToWebmBlob(file);
           results.wasm = {
-            blob: results.wasm,
-            time: wasmEndTime - wasmStartTime,
-            size: results.wasm.size
+            blob: wasmResult.blob,
+            time: wasmResult.duration,
+            rgbaTime: wasmResult.rgbaConversionTime,
+            size: wasmResult.size
           };
-          logEl.textContent += `   ✓ WASM解码完成，耗时: ${results.wasm.time.toFixed(2)}ms\n`;
+          logEl.textContent += `   ✓ WASM解码完成，总耗时: ${results.wasm.time.toFixed(2)}ms (RGBA转换: ${results.wasm.rgbaTime?.toFixed(2) || 'N/A'}ms)\n`;
         } catch (error) {
           logEl.textContent += `   ✗ WASM解码失败: ${error.message}\n`;
           results.wasm = { error: error.message };
@@ -800,7 +1052,8 @@
       if (results.native && !results.native.error) {
         nativeResultEl.innerHTML = `
           <h5>原生 AudioDecoder 结果</h5>
-          <p>解码时间: ${results.native.time.toFixed(2)}ms</p>
+          <p>总耗时: ${results.native.time.toFixed(2)}ms</p>
+          <p>PCM转换: ${results.native.pcmTime?.toFixed(2) || 'N/A'}ms</p>
           <p>输出大小: ${results.native.size} bytes</p>
           <audio controls src="${URL.createObjectURL(results.native.blob)}"></audio>
         `;
@@ -816,7 +1069,8 @@
       if (results.wasm && !results.wasm.error) {
         wasmResultEl.innerHTML = `
           <h5>WASM (FFmpeg) 结果</h5>
-          <p>解码时间: ${results.wasm.time.toFixed(2)}ms</p>
+          <p>总耗时: ${results.wasm.time.toFixed(2)}ms</p>
+          <p>PCM转换: ${results.wasm.pcmTime?.toFixed(2) || 'N/A'}ms</p>
           <p>输出大小: ${results.wasm.size} bytes</p>
           <audio controls src="${URL.createObjectURL(results.wasm.blob)}"></audio>
         `;
@@ -860,9 +1114,10 @@
       // 原生结果
       if (results.native && !results.native.error) {
         nativeResultEl.innerHTML = `
-          <h5>原生 VideoDecoder 结果</h5>
-          <p>解码时间: ${results.native.time.toFixed(2)}ms</p>
-          <p>输出大小: ${results.native.size} bytes</p>
+          <h5>原生 VideoDecoder + MediaRecorder 结果</h5>
+          <p>总耗时: ${results.native.time.toFixed(2)}ms</p>
+          <p>RGBA转换: ${results.native.rgbaTime?.toFixed(2) || 'N/A'}ms</p>
+          <p>WebM 文件大小: ${results.native.size} bytes</p>
           <video controls src="${URL.createObjectURL(results.native.blob)}"></video>
         `;
       } else {
@@ -876,9 +1131,10 @@
       // WASM结果
       if (results.wasm && !results.wasm.error) {
         wasmResultEl.innerHTML = `
-          <h5>WASM (FFmpeg) 结果</h5>
-          <p>解码时间: ${results.wasm.time.toFixed(2)}ms</p>
-          <p>输出大小: ${results.wasm.size} bytes</p>
+          <h5>WASM (FFmpeg) + MediaRecorder 结果</h5>
+          <p>总耗时: ${results.wasm.time.toFixed(2)}ms</p>
+          <p>RGBA转换: ${results.wasm.rgbaTime?.toFixed(2) || 'N/A'}ms</p>
+          <p>WebM 文件大小: ${results.wasm.size} bytes</p>
           <video controls src="${URL.createObjectURL(results.wasm.blob)}"></video>
         `;
       } else {
@@ -891,19 +1147,20 @@
       // 性能对比
       if (results.native && results.wasm && !results.native.error && !results.wasm.error) {
         const speedRatio = results.wasm.time / results.native.time;
-        const fasterMethod = results.native.time < results.wasm.time ? '原生 VideoDecoder' : 'WASM (FFmpeg)';
+        const fasterMethod = results.native.time < results.wasm.time ? '原生 VideoDecoder + MediaRecorder' : 'WASM (FFmpeg) + MediaRecorder';
         const speedDifference = Math.abs(results.native.time - results.wasm.time);
         const efficiency = results.native.time < results.wasm.time ? 
-          `原生解码比 WASM 快 ${((results.wasm.time / results.native.time - 1) * 100).toFixed(1)}%` :
-          `WASM 解码比原生快 ${((results.native.time / results.wasm.time - 1) * 100).toFixed(1)}%`;
+          `原生解码+编码比 WASM 快 ${((results.wasm.time / results.native.time - 1) * 100).toFixed(1)}%` :
+          `WASM 解码+编码比原生快 ${((results.native.time / results.wasm.time - 1) * 100).toFixed(1)}%`;
         
         comparisonEl.innerHTML = `
-          <h5>性能对比</h5>
-          <p><strong>速度对比:</strong> ${fasterMethod} 更快</p>
+          <h5>性能对比（生成有效 WebM 文件）</h5>
+          <p><strong>总处理时间:</strong> ${fasterMethod} 更快</p>
           <p><strong>时间差:</strong> ${speedDifference.toFixed(2)}ms</p>
           <p><strong>速度比:</strong> ${speedRatio.toFixed(2)}x</p>
           <p><strong>效率提升:</strong> ${efficiency}</p>
-          <p><strong>大小对比:</strong> 原生 ${results.native.size} bytes vs WASM ${results.wasm.size} bytes</p>
+          <p><strong>WebM 文件大小:</strong> 原生 ${results.native.size} bytes vs WASM ${results.wasm.size} bytes</p>
+          <p><small><strong>注:</strong> 两种方法都使用 MediaRecorder API 进行最终编码，确保生成可播放的 WebM 文件。</small></p>
         `;
       } else {
         comparisonEl.innerHTML = `

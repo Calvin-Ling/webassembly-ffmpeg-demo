@@ -24,6 +24,6 @@ extern "C" int decode_opus_to_pcm(const uint8_t *input, int input_size,
 //   width, height: 输出图像宽高
 // 返回: 0 表示成功，其它为错误码
 extern "C" int decode_h264_to_rgba(const uint8_t *input, int input_size,
-                                   uint8_t **output, int *width, int *height);
+                                   uint8_t **output, int *width, int *height, int *frames);
 
 #endif // FFMPEG_WRAPPER_H
